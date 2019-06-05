@@ -9,11 +9,11 @@ pushd Ongoing-Study
 git subtree split -P cpp/CMake/libsodium -b libsodium-cmake
 popd
 
-mkdir libsodium-cmake
-cd libsodium-cmake
+mkdir libsodium.cmake
+cd libsodium.cmake
 git init
 git pull ../Ongoing-Study libsodium-cmake
-git remote add origin https://github.com/myd7349/libsodium-cmake.git
+git remote add origin https://github.com/myd7349/libsodium.cmake.git
 git push origin -u master
 ```
 
@@ -25,12 +25,17 @@ This project has been tested with these `libsodium` versions:
 * 1.0.18
 * 1.0.17
 
-The test projects is here:
+Test projects:
 
 * [findlibsodium_test](https://github.com/myd7349/Ongoing-Study/tree/master/cpp/CMake/vcpkg/findsodium_test)
 * [libsodium_test](https://github.com/myd7349/Ongoing-Study/tree/master/cpp/CMake/vcpkg/libsodium_test)
 
-LICENSE
+License
 =====
 
 MIT
+
+See Also
+=====
+* [cmake-libsodium](https://github.com/imefisto/cmake-libsodium)
+* [libsodium-cmake](https://github.com/robinlinden/libsodium-cmake)
