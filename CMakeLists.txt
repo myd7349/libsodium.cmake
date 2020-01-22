@@ -7,15 +7,22 @@ foreach (line ${config_ac_contents})
         set(VERSION ${CMAKE_MATCH_1})
     elseif (line MATCHES "SODIUM_LIBRARY_VERSION_(MAJOR|MINOR)=([0-9]+)")
         set(SODIUM_LIBRARY_VERSION_${CMAKE_MATCH_1} ${CMAKE_MATCH_2})
+    elseif (line MATCHES "DLL_VERSION=([0-9]+)")
+        set(DLL_VERSION ${CMAKE_MATCH_1})
+    elseif (line MATCHES "SODIUM_LIBRARY_VERSION=([0-9]+:[0-9]+:[0-9]+)")
+        set(SODIUM_LIBRARY_VERSION ${CMAKE_MATCH_1})
     endif ()
 endforeach ()
 
-message("VERSION: ${VERSION}")
-message("SODIUM_LIBRARY_VERSION_MAJOR: ${SODIUM_LIBRARY_VERSION_MAJOR}")
-message("SODIUM_LIBRARY_VERSION_MINOR: ${SODIUM_LIBRARY_VERSION_MINOR}")
+message(STATUS "VERSION: ${VERSION}")
+message(STATUS "SODIUM_LIBRARY_VERSION_MAJOR: ${SODIUM_LIBRARY_VERSION_MAJOR}")
+message(STATUS "SODIUM_LIBRARY_VERSION_MINOR: ${SODIUM_LIBRARY_VERSION_MINOR}")
+message(STATUS "DLL_VERSION: ${DLL_VERSION}")
+message(STATUS "SODIUM_LIBRARY_VERSION: ${SODIUM_LIBRARY_VERSION}")
 
-project(sodium VERSION ${VERSION} LANGUAGES C ASM)
+project(sodium VERSION ${VERSION} LANGUAGES C)
 
+include(CheckCCompilerFlag)
 include(CheckCSourceCompiles)
 include(CheckFunctionExists)
 include(CheckIncludeFile)
@@ -31,11 +38,30 @@ set(CMAKE_DISABLE_IN_SOURCE_BUILD ON)
 
 option(BUILD_SHARED_LIBS "Build shared library" ${BUILD_SHARED_LIBS})
 option(ENABLE_SSP "Compile with -fstack-protector" ON)
-option(ENABLE_PIE "Compile with -fPIE" ON)
-option(ENABLE_BLOCKING_RANDOM "Enable blocking random" OFF)
+option(ENABLE_ASM "Compile assembly code, only for use with targets such as WebAssembly" ON)
+option(ENABLE_PIE "Produce position independent executables" ON)
+option(ENABLE_BLOCKING_RANDOM "Enable this switch only if /dev/urandom is totally broken on the target platform" OFF)
 option(ENABLE_MINIMAL "Only compile the minimum set of functions required for the high-level API" OFF)
 option(ENABLE_PTHREADS "Use pthreads library" ON)
 option(ENABLE_RETPOLINE "Use return trampolines for indirect calls" OFF)
+
+# TODO: maintainers only options
+
+
+if (DEFINED ENV{EMSCRIPTEN})
+    check_c_compiler_flag("-s ASSERTIONS=0" USING_EMCC)
+    if (USING_EMCC)
+        set(ENABLE_ASM OFF)
+        message(WARNING "Compiling to JavaScript - asm implementations disabled")
+    else ()
+        message(WARNING "EMSCRIPTEN environment variable defined, but emcc doesn't appear to be used - Assuming compilation to native code")
+        add_compile_options(-U__EMSCRIPTEN__)
+    endif ()
+endif ()
+
+if (MINGW OR CYGWIN OR MSYS)
+    set(ENABLE_PIE OFF)
+endif ()
 
 if (ENABLE_MINIMAL)
     set(SODIUM_LIBRARY_MINIMAL_DEF "#define SODIUM_LIBRARY_MINIMAL 1")
@@ -76,6 +102,24 @@ add_library(${PROJECT_NAME}
     ${sodium_sources}
 )
 
+if (ENABLE_MINIMAL)
+    target_compile_definitions(${PROJECT_NAME} PRIVATE MINIMAL)
+endif ()
+
+if (ENABLE_PTHREADS)
+    find_package(Threads QUIET)
+
+    if (Threads_FOUND AND CMAKE_USE_PTHREADS_INIT)
+        message(STATUS "Thread local storage is supported")
+        target_compile_definitions(${PROJECT_NAME} PRIVATE HAVE_PTHREAD)
+        target_compile_options(${PROJECT_NAME} PRIVATE -ftls-model=local-dynamic)
+        target_link_libraries(${PROJECT_NAME} PUBLIC Threads::Threads)
+    else ()
+        message(STATUS "Thread local storage is not supported")
+        set(ENABLE_PTHREADS OFF)
+    endif ()
+endif ()
+
 set_target_properties(${PROJECT_NAME}
     PROPERTIES
         PREFIX ""
@@ -89,6 +133,30 @@ if (IS_BIG_ENDIAN)
 else ()
     target_compile_definitions(${PROJECT_NAME} PRIVATE NATIVE_LITTLE_ENDIAN)
 endif ()
+
+function (sodium_check_compile_flag flag)
+    set(required_quiet_old_value ${CMAKE_REQUIRED_QUIET})
+    set(CMAKE_REQUIRED_QUIET ON)
+
+    check_c_compiler_flag(${flag} IS_KNOWN_FLAG)
+
+    if (IS_KNOWN_FLAG)
+        message(STATUS "Check compile flag: ${flag} - Success")
+        target_compile_options(${target} PRIVATE ${flag})
+    else ()
+        message(STATUS "Check compile flag: ${flag} - Failed")
+    endif ()
+
+    unset(IS_KNOWN_FLAG CACHE)
+
+    set(CMAKE_REQUIRED_QUIET ${required_quiet_old_value})
+endfunction ()
+
+macro (sodium_check_compile_flag_if condition flag)
+    if (${condition})
+        sodium_check_compile_flag(${flag})
+    endif ()
+endmacro ()
 
 macro (sodium_check_func func var)
     check_function_exists(${func} ${var})
@@ -115,83 +183,138 @@ if (MSVC)
             advapi32
     )
 else ()
+    if (ENABLE_PIE)
+        target_compile_options(${PROJECT_NAME} PRIVATE -fPIE)
+        # TODO: LDFLAGS: -pie
+    endif ()
+
     if (ENABLE_BLOCKING_RANDOM)
         target_compile_definitions(${PROJECT_NAME} PRIVATE USE_BLOCKING_RANDOM)
     endif ()
 
-    if (ENABLE_PTHREADS)
-        target_compile_definitions(${PROJECT_NAME} PRIVATE HAVE_PTHREAD)
-        target_compile_options(${PROJECT_NAME} PRIVATE -ftls-model=local-dynamic)
-        target_compile_options(${PROJECT_NAME} PUBLIC -pthread)
-    endif ()
-
-    if (ENABLE_SSP)
-        target_compile_options(${PROJECT_NAME} PRIVATE -fstack-protector-all)
-    endif ()
-
-    if (ENABLE_PIE)
-        target_compile_options(${PROJECT_NAME} PRIVATE -fPIE)
-    endif ()
-
     if (ENABLE_RETPOLINE)
-        target_compile_options(${PROJECT_NAME}
-            PRIVATE
-                -mindirect-branch=thunk-inline
-                -mindirect-branch-register
-        )
+        check_c_compiler_flag(-mindirect-branch=thunk-inline MINDIRECT_BRANCH)
+        if (MINDIRECT_BRANCH)
+            target_compile_options(${PROJECT_NAME} PRIVATE -mindirect-branch=thunk-inline)
+        else ()
+            sodium_check_compile_flag(-mretpoline)
+        endif ()
+
+        sodium_check_compile_flag(-mindirect-branch-register)
     endif ()
 
-    target_compile_options(${PROJECT_NAME}
+    # TODO: AC_USE_SYSTEM_EXTENSIONS
+    target_compile_definitions(${PROJECT_NAME}
         PRIVATE
-            -flax-vector-conversions
-            -fvisibility=hidden
-            -fPIC
-            -fwrapv
-            -Wall
-            -Wextra
-            -Wbad-function-cast
-            -Wcast-qual
-            #-Wdiv-by-zero
-            -Wduplicated-branches
-            -Wduplicated-cond
-            -Wfloat-equal
-            -Wformat=2
-            -Wlogical-op
-            -Wmaybe-uninitialized
-            -Wmisleading-indentation
-            -Wmissing-declarations
-            -Wmissing-prototypes
-            -Wnested-externs
-            #-Wno-type-limits
-            #-Wno-unknown-pragmas
-            -Wnormalized=id
-            -Wnull-dereference
-            -Wold-style-declaration
-            -Wpointer-arith
-            -Wredundant-decls
-            -Wrestrict
-            #-Wsometimes-uninitialized
-            -Wstrict-prototypes
-            -Wswitch-enum
-            #-Wvariable-decl
-            -Wwrite-strings
-            -Wl,-z,relro
-            -Wl,-z,now
-            -Wl,-z,noexecstack
+            _GNU_SOURCE
+            __EXTENSIONS__
+            _POSIX_PTHREAD_SEMANTICS
+            _TANDEM_SOURCE
+            _ALL_SOURCE
+            _POSIX_SOURCE
+            _POSIX_1_SOURCE
+            _MINIX
     )
+
+    # AC_C_VARARRAYS
+    check_c_source_compiles(
+        "
+        int main(void)
+        {
+            static int x;
+            char a[++x];
+            a[sizeof a - 1] = 0;
+            return a[0];
+        }
+        "
+        HAVE_C_VARARRAYS
+    )
+
+    if (HAVE_C_VARARRAYS)
+        target_compile_definitions(${PROJECT_NAME} PRIVATE HAVE_C_VARARRAYS)
+    endif ()
+
+    if (NOT (MINGW OR CYGWIN OR MSYS)) # TODO: pw32, cegcc
+        sodium_check_compile_flag(-fPIC)
+        sodium_check_compile_flag(-fno-asynchronous-unwind-tables)
+        # TODO:
+        # -Wl,--dynamicbase
+        # -Wl,--high-entropy-va
+        # -Wl,--nxcompat
+    else ()
+        sodium_check_compile_flag_if(ENABLE_SSP -fstack-protector) # TODO
+    endif ()
+
+    sodium_check_compile_flag(-fvisibility=hidden)
+    sodium_check_compile_flag(-fno-strict-aliasing)
+
+    check_c_compiler_flag(-fno-strict-overflow NO_STRICT_OVERFLOW)
+    if (NO_STRICT_OVERFLOW)
+        target_compile_options(${PROJECT_NAME} PRIVATE -fno-strict-overflow)
+    else ()
+        sodium_check_compile_flag(-fwrapv)
+    endif ()
+
+    if (CMAKE_C_COMPILER_ID MATCHES "GNU")
+        # TODO: $host_cpu i?86|amd64|x86_64
+        sodium_check_compile_flag(-flax-vector-conversions)
+    endif ()
+
+    sodium_check_compile_flag((-Wall)
+    sodium_check_compile_flag(-Wextra)
+
+    sodium_check_compile_flag(-Wbad-function-cast)
+    sodium_check_compile_flag(-Wcast-qual)
+    sodium_check_compile_flag(-Wdiv-by-zero)
+    sodium_check_compile_flag(-Wduplicated-branches)
+    sodium_check_compile_flag(-Wduplicated-cond)
+    sodium_check_compile_flag(-Wfloat-equal)
+    sodium_check_compile_flag(-Wformat=2)
+    sodium_check_compile_flag(-Wlogical-op)
+    sodium_check_compile_flag(-Wmaybe-uninitialized)
+    sodium_check_compile_flag(-Wmisleading-indentation)
+    sodium_check_compile_flag(-Wmissing-declarations)
+    sodium_check_compile_flag(-Wmissing-prototypes)
+    sodium_check_compile_flag(-Wnested-externs)
+    sodium_check_compile_flag(-Wno-type-limits)
+    sodium_check_compile_flag(-Wno-unknown-pragmas)
+    sodium_check_compile_flag(-Wnormalized=id)
+    sodium_check_compile_flag(-Wnull-dereference)
+    sodium_check_compile_flag(-Wold-style-declaration)
+    sodium_check_compile_flag(-Wpointer-arith)
+    sodium_check_compile_flag(-Wredundant-decls)
+    sodium_check_compile_flag(-Wrestrict)
+    sodium_check_compile_flag(-Wshorten-64-to-32)
+    sodium_check_compile_flag(-Wsometimes-uninitialized)
+    sodium_check_compile_flag(-Wstrict-prototypes)
+    sodium_check_compile_flag(-Wswitch-enum)
+    sodium_check_compile_flag(-Wvariable-decl)
+    sodium_check_compile_flag(-Wwrite-strings)
+
+    # TODO:
+    # -Wl,-z,relro
+    # -Wl,-z,now
+    # -Wl,-z,noexecstack
 
     if (CMAKE_C_COMPILER_ID STREQUAL "Clang" OR
         CMAKE_C_COMPILER_ID STREQUAL "AppleClang")
-        target_compile_options(${PROJECT_NAME}
-            PRIVATE
-                -Wno-unknown-warning-option
-                -Wshorten-64-to-32
-        )
+        sodium_check_compile_flag(-Wno-unknown-warning-option)
+        sodium_check_compile_flag(-Wshorten-64-to-32)
     endif ()
 
     check_include_file(sys/mman.h HAVE_SYS_MMAN_H)
     if (HAVE_SYS_MMAN_H)
         target_compile_definitions(${PROJECT_NAME} PRIVATE HAVE_SYS_MMAN_H)
+    endif ()
+
+    check_include_file(sys/random.h HAVE_SYS_RANDOM_H)
+    if (HAVE_SYS_MMAN_H)
+        target_compile_definitions(${PROJECT_NAME} PRIVATE HAVE_SYS_RANDOM_H)
+    endif ()
+
+    check_include_file(intrin.h HAVE_INTRIN_H)
+    if (HAVE_SYS_MMAN_H)
+        target_compile_definitions(${PROJECT_NAME} PRIVATE HAVE_INTRIN_H)
     endif ()
 
     sodium_check_func(arc4random HAVE_SAFE_ARC4RANDOM)
@@ -461,6 +584,7 @@ else ()
         target_compile_definitions(${PROJECT_NAME} PRIVATE HAVE_INLINE_ASM=1)
     endif ()
 
+    # TODO: ENABLE_ASM
     check_c_source_compiles(
         "
         int main(void) {
@@ -484,10 +608,11 @@ else ()
         HAVE_AMD64_ASM
     )
 
-    if (HAVE_AMD64_ASM)
+    if (ENABLE_ASM AND HAVE_AMD64_ASM)
         target_compile_definitions(${PROJECT_NAME} PRIVATE HAVE_AMD64_ASM=1)
     endif ()
 
+    # TODO: ENABLE_ASM
     check_c_source_compiles(
         "
         int main(void) {
@@ -505,8 +630,8 @@ else ()
         HAVE_AVX_ASM
     )
 
-    if (HAVE_AVX_ASM)
-        target_compile_definitions(${PROJECT_NAME} PRIVATE HAVE_AVX_ASM=1)
+    if (ENABLE_ASM AND HAVE_AVX_ASM)
+        target_compile_definitions(${PROJECT_NAME} PRIVATE HAVE_AVX_ASM)
     endif ()
 
     check_c_source_compiles(
@@ -544,9 +669,10 @@ else ()
     )
 
     if (HAVE_TI_MODE)
-        target_compile_definitions(${PROJECT_NAME} PRIVATE HAVE_TI_MODE=1)
+        target_compile_definitions(${PROJECT_NAME} PRIVATE HAVE_TI_MODE)
     endif ()
 
+    # TODO: ENABLE_ASM
     check_c_source_compiles(
         "
         int main(void) {
@@ -560,8 +686,12 @@ else ()
         HAVE_CPUID
     )
 
-    if (HAVE_CPUID)
-        target_compile_definitions(${PROJECT_NAME} PRIVATE HAVE_CPUID=1)
+    if (ENABLE_ASM AND HAVE_CPUID)
+        target_compile_definitions(${PROJECT_NAME} PRIVATE HAVE_CPUID)
+    endif ()
+
+    if (ENABLE_ASM)
+        # TODO: ASM_HIDE_SYMBOL
     endif ()
 
     check_c_source_compiles(
@@ -579,6 +709,8 @@ else ()
     if (HAVE_WEAK_SYMBOLS)
         target_compile_definitions(${PROJECT_NAME} PRIVATE HAVE_WEAK_SYMBOLS=1)
     endif ()
+
+    # TODO: CPU_UNALIGNED_ACCESS
 
     check_c_source_compiles(
         "
@@ -740,5 +872,12 @@ install(
 # https://stackoverflow.com/questions/15132185/mixing-c-and-assembly-sources-and-build-with-cmake
 # https://stackoverflow.com/questions/647892/how-to-check-header-files-and-library-functions-in-cmake-like-it-is-done-in-auto
 # https://stackoverflow.com/questions/31038963/how-do-you-rename-a-library-filename-in-cmake
-# https://stackoverflow.com/questions/50468620/what-does-enable-testing-do-in-cmake
-# https://github.com/edenhill/librdkafka/blob/master/src-cpp/CMakeLists.txt
+# https://stackoverflow.com/questions/25043458/does-cmake-have-something-like-target-link-options
+# https://www.gnu.org/software/autoconf-archive/ax_check_compile_flag.html
+# https://www.gnu.org/savannah-checkouts/gnu/autoconf/manual/autoconf-2.69/autoconf.txt
+# https://github.com/tamaskenez/libuv-cmake/commit/92a8fb57bef5b3f6c9c25fb4af75157592718275
+# https://github.com/fish-shell/fish-shell/commit/d6e315d25db5c2a10b552cddd3aec93ce9398f26
+# https://lists.gnu.org/archive/html/bug-gnulib/2014-08/msg00024.html
+# https://github.com/ceph/ceph/pull/10755
+# https://github.com/opencv/opencv/blob/master/cmake/OpenCVCompilerOptimizations.cmake
+# https://stackoverflow.com/questions/6901369/how-to-detect-sse-availability-in-cmake

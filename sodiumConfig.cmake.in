@@ -9,10 +9,15 @@
 #   sodium_VERSION
 #
 
+include(CMakeFindDependencyMacro)
 include(FindPackageHandleStandardArgs)
 include(SelectLibraryConfigurations)
 
 @PACKAGE_INIT@
+
+if (@ENABLE_PTHREADS@)
+    find_dependency(Threads)
+endif ()
 
 if (NOT TARGET @TARGET_NAME@)
     include("${CMAKE_CURRENT_LIST_DIR}/unofficial-@PROJECT_NAME@Targets.cmake")
@@ -59,4 +64,3 @@ endif()
 # https://github.com/jedisct1/libsodium/blob/master/contrib/Findsodium.cmake
 # https://github.com/QuantStack/xeus/blob/master/xeusConfig.cmake.in
 # https://github.com/zeromq/libzmq/blob/master/builds/cmake/ZeroMQConfig.cmake.in
-# https://github.com/facebook/folly/blob/master/CMake/FindZstd.cmake
